@@ -1,0 +1,207 @@
+#!/usr/bin/python3
+
+#Written by SzaboD @ LeanNet
+#Please visit www.leannet.eu for more information
+
+#TODO: check dependencies... and python3...
+
+import os
+import sys
+import json
+from random import randint
+import subprocess
+from subprocess import call
+from subprocess import Popen, PIPE, STDOUT
+import netifaces
+import re
+
+def main():
+    config = ''.join(sys.stdin.readlines()) # read config json from stdin into a string
+
+    config_parameters = get_parameters_from_config(config)
+    environment_parameters = get_parameters_from_environment_variables()
+    parameters = {**config_parameters, **environment_parameters}
+
+    try:
+        if parameters["command"] == "ADD":
+            ipam_result = call_ipam_plugin(parameters["ipam"]["type"], config)
+            ip, cidr, gw = get_ip_cidr_gw_from_ipam_result(ipam_result)
+
+            create_ovs_bridge(parameters["bridge"], gw,  cidr)
+            create_netns_link(parameters["container_pid"])
+            ovs_port, container_port = create_veth_pair(parameters["container_id"])
+            of_port_num = ip.split(".")[3] # 4th octet of the IP
+            set_up_port_inside_host(parameters["bridge"], ovs_port, of_port_num)
+            set_up_port_inside_container(container_port, parameters["container_pid"], parameters["interface"], ip, cidr, gw)
+            delete_netns_link(parameters["container_pid"])
+
+            json.dump(json.loads(ipam_result), sys.stdout)
+        elif parameters["command"] == "DEL":
+            bridge_ip = get_bridge_ip(parameters["bridge"])
+            delete_ip_host_file(parameters["bridge"], parameters["network_name"], bridge_ip, parameters["container_id"])
+            delete_ovs_container_port(parameters["bridge"], parameters["container_id"])
+            json.dump('{"cniVersion": "0.2.0"}', sys.stdout)
+        else:
+            sys.exit(2)
+
+    except Exception:
+        # register exit handler
+        delete_netns_link(parameters["container_pid"])
+        sys.exit(2)
+
+
+def ip2mac(ip):
+    mac_address = "0a:58"
+    for dec in ip.split("."):
+        if int(dec) < 16:
+            mac_address += ":0" + '{0:x}'.format(int(dec))
+        else:
+            mac_address += ":" '{0:x}'.format(int(dec))
+    return mac_address
+
+
+def get_parameters_from_environment_variables():
+    parameters = {}
+    parameters["command"] = os.environ.get("CNI_COMMAND") # ADD | DEL | VERSION
+    parameters["container_id"] = os.environ.get("CNI_CONTAINERID")
+    if (os.environ.get("CNI_NETNS") != ""):
+        parameters["container_pid"] =  os.environ.get("CNI_NETNS").split("/")[2]
+    parameters["interface"] = os.environ.get("CNI_IFNAME")
+    parameters["cni_path"] = os.environ.get("CNI_PATH")
+    parameters["cni_args"] = os.environ.get("CNI_ARGS")
+
+    #for i in os.environ.get("CNI_ARGS").split(";"):
+    #    key,value = i.split("=")
+    #    parameters[key] = value
+
+    return parameters
+
+
+def get_mtu_size():
+    default_gw_name = netifaces.gateways()['default'][netifaces.AF_INET][1]
+    ps = Popen(['ifconfig', default_gw_name], stdout=subprocess.PIPE)
+    output = str(ps.communicate())
+    return int(re.findall("MTU:([0-9]+)", output)[0])
+
+
+def get_bridge_ip(bridge):
+    ps = Popen(['ifconfig', bridge], stdout=subprocess.PIPE)
+    output = str(ps.communicate())
+    return re.findall("inet addr:([0-9]+.[0-9]+.[0-9]+.[0-9]+)", output)[0]
+
+
+def get_json_config_from_stdin():
+    config = sys.stdin.readlines()
+    return json.loads(''.join(config))
+
+
+def call_ipam_plugin(plugin, config_string):
+    p = Popen(['/opt/cni/bin/' + plugin], stdout=PIPE, stdin=PIPE, stderr=PIPE)
+    ipam_result = p.communicate(input=config_string.encode())[0]
+    return ipam_result.decode()
+
+
+# TODO: return error if mandatory argument is missing
+def get_parameters_from_config(config):
+    config_json = json.loads(config)
+    parameters = {}
+
+    # expected parameters in the CNI specification:
+    parameters["cni_version"] = config_json["cniVersion"] # (string) version number
+    parameters["network_name"] = config_json["name"] # (string) network name
+    parameters["plugin"] = config_json["type"] # (string) plugin executable name
+    if "args" in config:
+        parameters["args"] = config_json["args"] # (dictionary) optional additional arguments
+    if "ipMasq" in config:
+        parameters["ip_masq"] = config_json["ipMasq"] # (boolean) if host acts as gateway for subnets that are unable to route to the IP assaigned to the container
+    parameters["ipam"] = config_json["ipam"] # (dictionary) IPAM specific values
+    if "dns" in config:
+        parameters["dns"] = config_json["dns"] # (dictionary) values: nameservers, domain, search, options
+
+    # additional parameters defined by the plugin:
+    parameters["bridge"] = config_json["bridge"] # (string) name of the OpenVSwitch
+
+    return parameters
+
+# TODO: currently we deal with ipv4 only - should deal with ipv6 too
+# TODO: not sure whether this is the last version of the outpout format
+def get_ip_cidr_gw_from_ipam_result(config):
+    config_json = json.loads(config)
+
+    if "ip4" in config_json:
+        ip_type = "ip4"
+    else:
+        ip_type = "ip6"
+
+    ip_and_cidr = config_json[ip_type]["ip"]
+    ip = ip_and_cidr.split("/")[0]
+    cidr = ip_and_cidr.split("/")[1]
+    gw = config_json[ip_type]["gateway"]
+
+    return (ip, cidr, gw)
+
+
+def create_ovs_bridge(bridge, gw, cidr):
+    if call(["ovs-vsctl", "br-exists", bridge]) == 2:
+        call(["ovs-vsctl", "add-br", bridge])
+        call(["ifconfig", bridge, gw + "/" + cidr, "up"])
+        call(["ovs-vsctl", "add-port", bridge, "vxlan0", "--", "set", "interface", "vxlan0", "type=vxlan", "option:key=flow", "option:remote_ip=flow"])
+        call(["ovs-vsctl", "set-controller", bridge, "ptcp:16633"])
+        call(["ovs-vsctl", "set", "bridge", bridge, "other-config:hwaddr=\"" + ip2mac(gw) + "\""])
+
+
+def set_up_port_inside_host(bridge, port, of_port_num):
+    #print(".")
+    call(["ip", "link", "set", port, "up"])
+    #print("..")
+    if call(["ovs-vsctl", "add-port", bridge, port, "--", "set", "interface", port, "ofport_request=" + of_port_num]) != 0:
+        sys.exit(0)
+
+
+def set_up_port_inside_container(port, pid, interface, ip, cidr, gw):
+    call(["ip", "link", "set", port, "netns", pid])
+    call(["ip", "netns", "exec", pid, "ip", "link", "set", "dev", port, "name", interface])
+    call(["ip", "netns", "exec", pid, "ip", "link", "set", interface, "address", ip2mac(ip)])
+    call(["ip", "netns", "exec", pid, "ip", "link", "set", "dev", interface, "mtu", str(get_mtu_size() - 50)]) # VXLAN header = 50b
+    call(["ip", "netns", "exec", pid, "ip", "link", "set", interface, "up"])
+    call(["ip", "netns", "exec", pid, "ip", "addr", "add", ip + "/" + cidr, "dev", interface])
+    call(["ip", "netns", "exec", pid, "ip", "route", "add", "default", "via", gw])
+    call(["ip", "netns", "exec", pid, "arp", "-s", gw, ip2mac(gw)])
+
+
+# we need to create a link in /var/run/netns in order to be able to reach the namespace with "ip netns"
+def create_netns_link(id):
+    call(["mkdir", "-p", "/var/run/netns"])
+    if not os.path.exists("/var/run/netns/" + id):
+        call(["ln", "-s", "/proc/" + id + "/ns/net", "/var/run/netns/" + id])
+
+
+def create_veth_pair(container_id):
+    id = container_id[:8]
+    ovs_port = "veth_" + str(id)
+    container_port = "veth_" + str(id) + "_c"
+    call(["ip", "link", "add", ovs_port, "type", "veth", "peer", "name", container_port])
+    return [ovs_port, container_port]
+
+
+def delete_ip_host_file(bridge, network_name, ip, container_id):
+    id = container_id[:8]
+    ovs_port = "veth_" + str(id)
+    p = Popen(["ovs-vsctl", "get", "interface", ovs_port, "ofport"], stdin=PIPE, stdout=PIPE, stderr=PIPE)
+    of_port_num = p.communicate()[0].decode().strip()
+    del_ip = ".".join(ip.split(".")[0:3])+"." + of_port_num # of_port_num equals to the 4th octet of the container IP
+    os.remove("/var/lib/cni/networks" + "/" + network_name + "/" + del_ip)
+
+
+def delete_ovs_container_port(bridge, container_id):
+    id = container_id[:8]
+    ovs_port = "veth_" + str(id)
+    call(["ovs-vsctl", "del-port", bridge, ovs_port])
+
+
+def delete_netns_link(pid):
+    call(["rm", "-f", "/var/run/netns/" + pid])
+
+
+if __name__ == "__main__":
+    main()
