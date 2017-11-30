@@ -2,13 +2,13 @@
 This CNI plugin was created by LeanNet in order to further
 popularize Open vSwitch based container cluster networking.
 
-This simple pluging connect containers / pods directly to an
+This simple pluging connects containers / pods directly to an
 OVS bridge called br0, which eliminates the usage of any Linux Bridge,
 and opens up the possiblities for high-level software defined networking.
 
-Currenly we run the plugin as a native script on Kuberentes hosts.
+Currently we run the plugin as a native script on Kuberentes hosts.
 Later releases will include Docker format.
-But for now, in order to install do this::
+But for now, in order to install do this:
 
     $ apt install -y openvswitch python3 python3-pip
     $ pip3 install netifaces
